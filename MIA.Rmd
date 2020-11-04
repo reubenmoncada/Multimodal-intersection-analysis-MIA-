@@ -1,0 +1,258 @@
+---
+title: "Multimodal intersection analysis (MIA) tutorial"
+author: "Reuben Moncada"
+date: "11/3/2020"
+output: html_document
+---
+
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### This tutorial will walk through multimodal intersection analysis (MIA) for the integration of single-cell RNA-seq (scRNA-seq) and microarray-based spatial transcriptomics (ST) data, as described in Moncada et al. Nature Biotechnology (2020). We will start with the scRNA-seq and ST for the PDAC-A sample.
+
+_____________________________________________________________________________________________________________________________________________
+
+
+##### Let's begin by loading the filtered scRNA-seq data for PDAC-A (GEO accession GSE111672) and converting the data to a Seurat object for analysis.
+##### The scRNA-seq expression matrix from GEO already has cluster annotations as the column header, so we won't need to cluster the data.
+
+```{r, message=FALSE}
+library(Seurat)
+library(dplyr)
+library(stringi)
+library(ggplot2)
+library(reshape2)
+library(scales)
+```
+
+
+
+```{r}
+# Load PDAC-A scRNA-seq expression matrix
+sc <- read.table('GSE111672_PDAC-A-indrop-filtered-expMat.txt', sep = '\t', header = FALSE)
+cluster_assignments <- as.character(sc[1,])[-(1:1)] # Extract cluster annotations
+genes <- sc[-(1:1),1]                               # Extract genes
+sc <- sc[-(1:1),-(1:1)]                             # Remove genes and cluster annotations from expression matrix
+rownames(sc) <- make.names(genes, unique = TRUE)    # Set rownames of expression matrix to the list of genes
+
+sc <- CreateSeuratObject(sc, assay = 'RNA')         # Create Seurat object
+Idents(sc) <- cluster_assignments                   # Use the original cluster annotations as the cell identities
+
+# Collapse subpopulations into broader cell type annotations
+sc <- RenameIdents(object = sc, 'Macrophages A' = 'Macrophages')
+sc <- RenameIdents(object = sc, 'Macrophages B' = 'Macrophages')
+
+sc <- RenameIdents(object = sc, 'Ductal - terminal ductal like' = 'Ductal')
+sc <- RenameIdents(object = sc, 'Ductal - APOL1 high/hypoxic' = 'Ductal')
+sc <- RenameIdents(object = sc, 'Ductal - MHC Class II' = 'Ductal')
+sc <- RenameIdents(object = sc, 'Ductal - CRISP3 high/centroacinar like' = 'Ductal')
+
+sc <- RenameIdents(object = sc, 'mDCs A' = 'mDCs')
+sc <- RenameIdents(object = sc, 'mDCs B' = 'mDCs')
+```
+
+
+##### Now we'll load the PDAC-A-ST1 ST data. The column headers of the data contain the tissue coordinates of each ST spot.
+```{r}
+# Load PDAC-A-ST1 expression matrix:
+st <- read.table('GSM3036911_PDAC-A-ST1-filtered.txt', sep = '\t', header = TRUE)
+genes <- st[,1]                               
+st <- st[,-(1:1)]
+rownames(st) <- make.names(genes, unique = TRUE)
+
+st <- CreateSeuratObject(st, assay = 'Spatial')
+
+# Create data frame of spot tissue_coordinates
+tissue_coord <- data.frame(row.names = colnames(st))
+
+for (i in colnames(st)) {
+  tissue_coord[i,'X'] <- (strsplit(sub('X', '', as.name(i)), 'x') %>% unlist())[1] %>% as.integer()
+  tissue_coord[i,'Y'] <- (strsplit(sub('X', '', as.name(i)), 'x') %>% unlist())[2] %>% as.integer()
+}
+```
+
+
+
+##### Let's normalize our scRNA-seq data prior to marker gene identification, and visualize our cell types with tSNE:
+```{r warning=FALSE, message=FALSE}
+sc <- NormalizeData(sc, normalization.method = "LogNormalize", scale.factor = median(sc$nCount_RNA), verbose = FALSE)
+sc <- ScaleData(sc, features = rownames(sc), verbose = FALSE)
+sc <- FindVariableFeatures(sc, selection.method = "vst", nfeatures = 1000, verbose = FALSE)
+sc <- RunPCA(sc, features = VariableFeatures(object = sc), verbose = FALSE)
+sc <- RunTSNE(sc, dims = 1:30, verbose = FALSE)
+
+# Visualize cell types
+DimPlot(sc, reduction = 'tsne', label = TRUE, pt.size = 0.5)
+```
+
+
+##### Now let's identify marker genes for each of our cell types:
+```{r}
+sc.markers <- FindAllMarkers(sc, only.pos = TRUE, test.use = 't', min.pct = 0.25, logfc.threshold = 0.25, verbose = FALSE)
+sc.markers['cluster'] %>% summary(maxsum=50) 
+```
+
+
+##### Switching back to the ST data:
+##### Since we don't have cluster annotations, let's cluster the ST data:
+```{r}
+st <- NormalizeData(st, normalization.method = "LogNormalize", scale.factor = median(st$nCount_Spatial), verbose = FALSE)
+st <- ScaleData(st, features = rownames(st), verbose = FALSE)
+st <- FindVariableFeatures(st, selection.method = "vst", nfeatures = 1000, verbose = FALSE)
+st <- RunPCA(st, features = VariableFeatures(object = st), verbose = FALSE)
+
+st <- FindNeighbors(st, dims = 1:10, verbose = FALSE)
+st <- FindClusters(st, resolution = 0.5, verbose = FALSE)
+
+# Add clustering assignments to tissue tissue_coordinate data frame
+tissue_coord$clusters <- Idents(st) %>% unlist() %>% as.character()
+
+# Visualize clusters
+ggplot(tissue_coord, aes(x=X, y=Y, color=clusters)) + 
+  geom_point(shape = 15, size = 5.5) + 
+  theme_minimal() +
+  theme(axis.text.x=element_blank(), axis.text.y=element_blank(),
+        axis.title.x = element_blank(), axis.title.y = element_blank(),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+```
+
+
+##### The clusters generally match the cluster assignments in the manuscript, so we can rename the clusters based on our prior knowledge:
+```{r}
+# Cluster 0 is stroma, cluster 1 is the duct epithelium, cluster 2 is the cancer region, and cluster 3 is pancreatic tissue.
+new.cluster.ids <- c('Stroma','Duct epithelium','Cancer','Pancreatic tissue')
+names(new.cluster.ids) <- levels(st)
+st <- RenameIdents(st, new.cluster.ids)
+
+tissue_coord$clusters <- Idents(st) %>% unlist() %>% as.character()
+
+ggplot(tissue_coord, aes(x=X, y=Y, color=clusters)) + 
+  geom_point(shape = 15, size = 5.5) + 
+  theme_minimal() +
+  theme(axis.text.x=element_blank(), axis.text.y=element_blank(),
+        axis.title.x = element_blank(), axis.title.y = element_blank(),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+```
+
+
+##### Now let's identify marker genes for each ST region:
+```{r}
+st.markers <- FindAllMarkers(st, only.pos = TRUE, logfc.threshold = 0.1, test.use = 't',verbose = FALSE)
+st.markers['cluster'] %>% summary()
+```
+
+
+## Multimodal Intersection Analysis (MIA)
+
+##### Now that we have a set of marker genes for the cell types and for the ST tissue regions, we can now integrate both datasets with MIA to determine where the scRNA-seq defined cell types localize in the tissue. 
+
+##### Briefly, MIA uses the hypergeometric cumulative distribution to measure the enrichment of cell-type specific marker genes (from scRNA-seq) within a list of tissue-region specific genes (from ST). We use this as a proxy for estimating the likelihood each cell type is localized to a given tissue region. 
+
+##### First, let's compile a list of marker genes for both the ST and scRNA-seq data:
+```{r}
+# Create a list object containing the marker genes for each ST region:
+st.clusts <- Idents(st) %>% levels()
+N <- length(st.clusts)
+
+st.marker.list <- vector(mode = 'list', length = N)
+names(st.marker.list) <- st.clusts
+for(i in st.clusts) {
+    st.marker.list[[i]] <- st.markers[st.markers$cluster == i,'gene']
+}
+
+# Create a list object containing the marker genes for each cell type:
+sc.clusts <- Idents(sc) %>% levels()
+M <- length(sc.clusts)
+
+sc.marker.list <- vector(mode = 'list', length = M)
+names(sc.marker.list) <- sc.clusts
+
+for (i in sc.clusts) {
+  sc.marker.list[[i]] <- sc.markers[sc.markers$cluster == i,'gene']
+}
+```
+
+##### Let's first demonstrate MIA with a single example: fibroblasts (scRNA-seq) and the cancer region (ST):
+
+```{r}
+
+gene.universe         <- length(rownames(st))                    
+cell.type.markers     <- sc.marker.list[["Fibroblasts"]] # Genes specific to fibroblasts
+tissue.region.markers <- st.marker.list[["Cancer"]]      # Genes specific to the cancer region
+common.genes          <- intersect(cell.type.markers,    # Common genes between these two gene sets
+                                   tissue.region.markers)
+
+# MIA:
+A <- length(common.genes)
+B <- length(cell.type.markers)
+C <- length(tissue.region.markers)
+enr <- -log10(phyper(A, B, gene.universe-B, C, lower.tail = FALSE))
+dep <- -log10(1-phyper(A, B, gene.universe-B, C, lower.tail = FALSE))
+if (enr < dep) {
+  MIA.results <- -dep
+} else {
+  MIA.results <- enr
+}
+
+print(MIA.results)
+```
+
+##### What this signifies is that the fibroblast genes are significantly enriched within the genes specific to the cancer region of the tissue.
+##### With a -log10(p-value) of ~13, one way to think about this is that there's approximately a 0.00000000000001% chance we observed such an overlap between the cell-type and tissue-region genes simply by chance. 
+
+##### In parallel we also test for cell type depletion by computing -log10(1-p). Here, we are estimating the likelihood for an observed lack of overlap between gene sets. 
+
+##### Let's use MIA to determine the cell type enrichments for all cell types and tissue regions:
+```{r}
+
+# Initialize a dataframe for us to store values in:
+N <- length(st.clusts) ; M <- length(sc.clusts)
+MIA.results <- matrix(0,nrow = M, ncol = N)
+row.names(MIA.results) <- sc.clusts
+colnames(MIA.results) <- st.clusts
+
+# Gene universe
+gene.universe <- length(rownames(st))
+
+  # Loop over ST clusters
+for (i in 1:N) {
+  # Then loop over SC clusters
+  for (j in 1:M) {
+    genes1 <- st.marker.list[[st.clusts[i]]]
+    genes2 <- sc.marker.list[[sc.clusts[j]]]
+    
+    # Hypergeometric    
+    A <- length(intersect(genes1,genes2))
+    B <- length(genes1)
+    C <- length(genes2)
+    enr <- -log10(phyper(A, B, gene.universe-B, C, lower.tail = FALSE))
+    dep <- -log10(1-phyper(A, B, gene.universe-B, C, lower.tail = FALSE))
+    if (enr < dep) {
+      MIA.results[j,i] = -dep
+    } else {
+      MIA.results[j,i] = enr
+    }
+  }
+}
+# Some results were -Inf...check why this is the case...
+MIA.results[is.infinite(MIA.results)] <- 0
+```
+
+```{r}
+# Visualize as heatmap
+
+heatmap_df <- data.frame('Cell types' = melt(MIA.results)[,1],
+                         'Tissue regions' = melt(MIA.results)[,2],
+                         enrichment = melt(MIA.results)[,3])
+
+ggplot(data = heatmap_df, aes(x = Tissue.regions, y = Cell.types, fill = enrichment)) +
+  geom_tile() + 
+  scale_fill_gradient2(low = "navyblue", high = "red", mid = "white", 
+                       midpoint = 0, limit = c(-10,10), space = "Lab", 
+                       oob=squish, name="Enrichment \n -log10(p)") +
+  ylim(heatmap_df$Cell.types %>% levels() %>% sort() %>% rev()) + 
+  theme_minimal()
+```
+
